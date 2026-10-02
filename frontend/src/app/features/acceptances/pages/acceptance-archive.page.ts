@@ -1,6 +1,6 @@
 import { Component, computed, inject, signal, type Signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { ActivatedRoute, Router } from '@angular/router';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { Store } from '@ngrx/store';
 import { toSignal } from '@angular/core/rxjs-interop';
 import { MatCardModule } from '@angular/material/card';
@@ -38,6 +38,7 @@ import { selectBridges, selectPiers } from '../../../core/store/bridge.selectors
 import { selectBearings } from '../../../core/store/bearing.selectors';
 import { selectStepStats } from '../../../core/store/step.selectors';
 import { selectStepState } from '../../../core/store/step.selectors';
+import { selectReviewItems } from '../../../core/store/offline.selectors';
 import { bridgeActions } from '../../../core/store/bridge.actions';
 import {
   DB_NAME,
@@ -74,6 +75,7 @@ import type {
   standalone: true,
   imports: [
     FormsModule,
+    RouterLink,
     MatCardModule,
     MatButtonModule,
     MatIconModule,
@@ -98,15 +100,23 @@ import type {
         </div>
       </div>
       <div class="gb-inline-actions">
+        <a mat-stroked-button [routerLink]="ROUTES.field">
+          <mat-icon>tablet_mac</mat-icon>
+          现场作业包
+        </a>
+        <a mat-flat-button color="primary" [routerLink]="ROUTES.merge">
+          <mat-icon>merge</mat-icon>
+          离线合并
+        </a>
         <button mat-stroked-button (click)="handleExport()">
           <mat-icon>cloud_download</mat-icon>
-          导出 JSON
+          整库导出
         </button>
         <label class="upload-label">
           <input type="file" accept="application/json" hidden (change)="handleImport($event)" />
           <span mat-stroked-button>
             <mat-icon>cloud_upload</mat-icon>
-            导入 JSON
+            整库导入
           </span>
         </label>
         <button mat-flat-button color="warn" (click)="handleReset()">
@@ -357,10 +367,21 @@ import type {
           }
         </div>
         <div class="gb-inline-actions" style="margin-top: 10px">
-          <button mat-flat-button color="primary" [disabled]="!activeBridgeId()" (click)="archiveActive(true)">
+          <button
+            mat-flat-button
+            color="primary"
+            [disabled]="!activeBridgeId() || openReviewCount(activeBridgeId() ?? '') > 0"
+            (click)="archiveActive(true)"
+          >
             <mat-icon>archive</mat-icon>
             执行竣工归档
           </button>
+          @if (activeBridgeId() && openReviewCount(activeBridgeId() ?? '') > 0) {
+            <a mat-stroked-button [routerLink]="ROUTES.merge">
+              <mat-icon>merge</mat-icon>
+              去处理待复核（{{ openReviewCount(activeBridgeId() ?? '') }} 条）
+            </a>
+          }
           <button mat-stroked-button [disabled]="!activeBridgeId()" (click)="archiveActive(false)">
             <mat-icon>unarchive</mat-icon>
             撤销归档
@@ -438,6 +459,7 @@ export class AcceptanceArchivePage {
     this.store.select((state) => state.acceptance.acceptances),
     { initialValue: [] as AcceptanceRow[] },
   );
+  private readonly reviewItems = toSignal(this.store.select(selectReviewItems), { initialValue: [] });
   private readonly counts = toSignal(this.idb.countAll$(), { initialValue: {} as Record<string, number> });
 
   readonly stats = toSignal(this.store.select(selectAcceptanceStats), {
@@ -585,7 +607,16 @@ export class AcceptanceArchivePage {
     const pierIds = new Set(this.piers().filter((item) => item.bridgeId === bridge.id).map((item) => item.id));
     const owned = this.bearingRows().filter((bearing) => pierIds.has(bearing.pierId));
     const passCount = owned.filter((bearing) => this.fullyAccepted(bearing.id)).length;
+    const openReview = this.openReviewCount(bridge.id);
+    if (openReview > 0) {
+      return `${bridge.name}：尚有 ${openReview} 条现场记录在待复核区，处理完成前不放行竣工归档。`;
+    }
     return `${bridge.name}：${archiveHint(passCount, owned.length)}`;
+  }
+
+  /** 指定桥梁未处理的待复核现场记录数（归档拦截） */
+  openReviewCount(bridgeId: string): number {
+    return this.reviewItems().filter((item) => item.bridgeId === bridgeId && item.status === 'open').length;
   }
 
   toggleBearing(bearingId: string): void {
@@ -671,6 +702,10 @@ export class AcceptanceArchivePage {
       readingCount: this.stepStats().readingCount,
     });
     if (archived) {
+      if (this.openReviewCount(bridgeId) > 0) {
+        this.notify('不满足归档条件：现场待复核记录尚未处理，请先到离线合并中心处理');
+        return;
+      }
       const pierIds = new Set(this.piers().filter((item) => item.bridgeId === bridgeId).map((item) => item.id));
       const owned = this.bearingRows().filter((bearing) => pierIds.has(bearing.pierId));
       const passCount = owned.filter((bearing) => this.fullyAccepted(bearing.id)).length;

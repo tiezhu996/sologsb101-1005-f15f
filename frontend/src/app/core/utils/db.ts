@@ -12,13 +12,17 @@ import type { Bearing, DiseaseGrade } from '../types/bearing';
 import type { Step, SyncRequirement } from '../types/step';
 import type { Reading } from '../types/reading';
 import type { Acceptance, AcceptanceStage } from '../types/acceptance';
+import type { MonitorPoint } from '../types/point';
+import { defaultPointsFor } from '../types/point';
+import type { FieldFact, FieldPackage } from '../types/field-package';
+import type { ImportCheckpoint, ReviewItem, ReviewStatus } from '../types/merge';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 
 /** 浏览器 IndexedDB 库名 */
 export const DB_NAME = 'gbbridgebear';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -29,6 +33,28 @@ export type BearingRow = Bearing;
 export type StepRow = Step;
 export type ReadingRow = Reading;
 export type AcceptanceRow = Acceptance;
+export type PointRow = MonitorPoint;
+export type ReviewItemRow = ReviewItem;
+export type ImportCheckpointRow = ImportCheckpoint;
+
+/** 已落账执行事实（幂等键为 factId） */
+export interface FieldFactRecord {
+  factId: string;
+  packageId: string;
+  bridgeId: string;
+  kind: FieldFact['kind'];
+  fact: FieldFact;
+  appliedAt: string;
+}
+
+/** 平板端现场包草稿（断网登记期间本地保存） */
+export interface FieldPackageRecord {
+  packageId: string;
+  bridgeId: string;
+  status: 'draft' | 'sealed';
+  updatedAt: string;
+  pkg: FieldPackage;
+}
 
 class BridgeBearingDatabase extends Dexie {
   bridges!: Table<BridgeRow, string>;
@@ -38,6 +64,16 @@ class BridgeBearingDatabase extends Dexie {
   readings!: Table<ReadingRow, string>;
   acceptances!: Table<AcceptanceRow, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
+  /** v3：测点台账（稳定挂接单元，支持撤去） */
+  points!: Table<PointRow, string>;
+  /** v3：已落账执行事实（factId 幂等） */
+  fieldFacts!: Table<FieldFactRecord, string>;
+  /** v3：待复核记录（找不到归属的现场事实） */
+  reviewItems!: Table<ReviewItemRow, string>;
+  /** v3：现场包导入检查点（失败保留 / 重试 / 幂等） */
+  importCheckpoints!: Table<ImportCheckpointRow, string>;
+  /** v3：平板端现场包草稿 */
+  fieldPackages!: Table<FieldPackageRecord, string>;
 
   constructor() {
     super(DB_NAME);
@@ -100,6 +136,20 @@ class BridgeBearingDatabase extends Dexie {
           if (typeof row.targetLiftMm !== 'number' && typeof row.lift === 'number') row.targetLiftMm = row.lift;
         });
       });
+
+    // v3：离线现场包合并
+    //   points        测点台账（稳定挂接单元，支持“撤去测点”）
+    //   fieldFacts    已落账执行事实（factId 幂等，重导不重复生成读数 / 验收）
+    //   reviewItems   待复核记录（找不到归属的现场事实，处理前禁止整桥归档）
+    //   importCheckpoints 导入检查点（失败保留、支持重试）
+    //   fieldPackages 平板端现场包草稿
+    this.version(DB_SCHEMA_VERSION).stores({
+      points: 'id, stepId, pointCode, status, [stepId+pointCode]',
+      fieldFacts: 'factId, packageId, bridgeId, kind',
+      reviewItems: 'id, status, reason, factKind, sourcePackageId, bridgeId',
+      importCheckpoints: 'id, packageId, bridgeId, status, attemptedAt',
+      fieldPackages: 'packageId, bridgeId, status, updatedAt',
+    });
   }
 }
 
@@ -228,6 +278,7 @@ async function seedDatabase(): Promise<void> {
   const piers: PierRow[] = [];
   const bearings: BearingRow[] = [];
   const steps: StepRow[] = [];
+  const points: PointRow[] = [];
   const readings: ReadingRow[] = [];
   const acceptances: AcceptanceRow[] = [];
 
@@ -309,9 +360,23 @@ async function seedDatabase(): Promise<void> {
         revision: ROW_REVISION,
       });
 
+      // 测点台账：按同步要求布置稳定测点（单点 1 个，同步 / 交叉四角）
+      // 未开始的步骤同样先建测点，供现场包发放；仅暂不产生读数
+      const pointCodes = defaultPointsFor(stepSpec.sync);
+      const pointRows = pointCodes.map((code, pointIndex) => ({
+        id: `point-${stepId}-${pointIndex + 1}`,
+        stepId,
+        pointCode: code,
+        location: `测点 ${code}`,
+        status: 'active' as const,
+        createdAt: stamp,
+        revision: ROW_REVISION,
+      }));
+      points.push(...pointRows);
+
       // 未开始的步骤不产生读数
       if (stepSpec.state === 'idle') return;
-      const pointCount = stepSpec.sync === 'single' ? 1 : 4;
+      const pointCount = pointRows.length;
       const rounds = stepSpec.state === 'arrived' ? 3 : 2;
       for (let round = 0; round < rounds; round += 1) {
         for (let point = 0; point < pointCount; point += 1) {
@@ -320,7 +385,7 @@ async function seedDatabase(): Promise<void> {
           readings.push({
             id: `read-${stepId}-${round + 1}-${point + 1}`,
             stepId,
-            pointCode: `P${point + 1}`,
+            pointCode: pointRows[point].pointCode,
             displacementMm: Number((base + jitter).toFixed(2)),
             stressMpa: Number((7 + random() * 6).toFixed(2)),
             recordedAt: dateTimeText(0, 9 + round, 5 + point * 5),
@@ -335,12 +400,25 @@ async function seedDatabase(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [
+      db.bridges,
+      db.piers,
+      db.bearings,
+      db.steps,
+      db.points,
+      db.readings,
+      db.acceptances,
+      db.fieldFacts,
+      db.reviewItems,
+      db.importCheckpoints,
+      db.fieldPackages,
+    ],
     async () => {
       await db.bridges.bulkPut(bridges);
       await db.piers.bulkPut(piers);
       await db.bearings.bulkPut(bearings);
       await db.steps.bulkPut(steps);
+      await db.points.bulkPut(points);
       await db.readings.bulkPut(readings);
       await db.acceptances.bulkPut(acceptances);
     },
@@ -368,11 +446,20 @@ export async function putBridge(row: BridgeRow): Promise<void> {
   await db.bridges.put(row);
 }
 
-/** 删除桥梁并级联清理墩台 / 支座 / 步骤 / 读数 / 验收 */
+/** 删除桥梁并级联清理墩台 / 支座 / 步骤 / 测点 / 读数 / 验收 */
 export async function removeBridge(id: string): Promise<void> {
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [
+      db.bridges,
+      db.piers,
+      db.bearings,
+      db.steps,
+      db.points,
+      db.readings,
+      db.acceptances,
+      db.fieldFacts,
+    ],
     async () => {
       const piers = await db.piers.where('bridgeId').equals(id).toArray();
       const pierIds = piers.map((item) => item.id);
@@ -381,7 +468,11 @@ export async function removeBridge(id: string): Promise<void> {
       const stepRows = await db.steps.where('bridgeId').equals(id).toArray();
       const stepIds = stepRows.map((item) => item.id);
       if (bearingIds.length) await db.acceptances.where('bearingId').anyOf(bearingIds).delete();
-      if (stepIds.length) await db.readings.where('stepId').anyOf(stepIds).delete();
+      if (stepIds.length) {
+        await db.readings.where('stepId').anyOf(stepIds).delete();
+        await db.points.where('stepId').anyOf(stepIds).delete();
+      }
+      await db.fieldFacts.where('bridgeId').equals(id).delete();
       await db.steps.where('bridgeId').equals(id).delete();
       if (pierIds.length) await db.bearings.where('pierId').anyOf(pierIds).delete();
       await db.piers.where('bridgeId').equals(id).delete();
@@ -447,8 +538,9 @@ export async function putSteps(rows: StepRow[]): Promise<void> {
 }
 
 export async function removeStep(id: string): Promise<void> {
-  await db.transaction('rw', [db.steps, db.readings], async () => {
+  await db.transaction('rw', [db.steps, db.points, db.readings], async () => {
     await db.readings.where('stepId').equals(id).delete();
+    await db.points.where('stepId').equals(id).delete();
     await db.steps.delete(id);
   });
 }
@@ -485,6 +577,111 @@ export async function removeAcceptance(id: string): Promise<void> {
   await db.acceptances.delete(id);
 }
 
+/* ============================ 测点台账 ============================ */
+
+export async function listPoints(): Promise<PointRow[]> {
+  return db.points.toArray();
+}
+
+export async function putPoint(row: PointRow): Promise<void> {
+  await db.points.put(row);
+}
+
+export async function putPoints(rows: PointRow[]): Promise<void> {
+  await db.points.bulkPut(rows);
+}
+
+/** 撤去测点：历史读数保留，仅置状态（后续现场事实进待复核区） */
+export async function retirePoint(id: string): Promise<void> {
+  const existing = await db.points.get(id);
+  if (existing) await db.points.put({ ...existing, status: 'retired' });
+}
+
+/** 恢复在用测点 */
+export async function activatePoint(id: string): Promise<void> {
+  const existing = await db.points.get(id);
+  if (existing) await db.points.put({ ...existing, status: 'active' });
+}
+
+export async function removePoint(id: string): Promise<void> {
+  await db.points.delete(id);
+}
+
+/* ========================== 已落账执行事实 ========================== */
+
+export async function listFieldFactRecords(): Promise<FieldFactRecord[]> {
+  return db.fieldFacts.toArray();
+}
+
+export async function putFieldFactRecord(record: FieldFactRecord): Promise<void> {
+  await db.fieldFacts.put(record);
+}
+
+/* ============================ 待复核记录 ============================ */
+
+export async function listReviewItems(): Promise<ReviewItemRow[]> {
+  const rows = await db.reviewItems.toArray();
+  return rows.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+}
+
+export async function putReviewItem(row: ReviewItemRow): Promise<void> {
+  await db.reviewItems.put(row);
+}
+
+export async function updateReviewStatus(id: string, status: ReviewStatus, resolution: string): Promise<void> {
+  const existing = await db.reviewItems.get(id);
+  if (!existing) return;
+  await db.reviewItems.put({
+    ...existing,
+    status,
+    resolution,
+    resolvedAt: status === 'resolved' ? new Date().toISOString() : '',
+  });
+}
+
+export async function removeReviewItem(id: string): Promise<void> {
+  await db.reviewItems.delete(id);
+}
+
+/* ========================== 导入检查点 / 现场包草稿 ========================== */
+
+export async function listImportCheckpoints(): Promise<ImportCheckpointRow[]> {
+  const rows = await db.importCheckpoints.toArray();
+  return rows.sort((a, b) => (a.attemptedAt < b.attemptedAt ? 1 : -1));
+}
+
+export async function getImportCheckpoint(packageId: string): Promise<ImportCheckpointRow | undefined> {
+  return db.importCheckpoints.where('packageId').equals(packageId).first();
+}
+
+export async function getImportCheckpointById(id: string): Promise<ImportCheckpointRow | undefined> {
+  return db.importCheckpoints.get(id);
+}
+
+export async function putImportCheckpoint(row: ImportCheckpointRow): Promise<void> {
+  await db.importCheckpoints.put(row);
+}
+
+export async function removeImportCheckpoint(id: string): Promise<void> {
+  await db.importCheckpoints.delete(id);
+}
+
+export async function listFieldPackageRecords(): Promise<FieldPackageRecord[]> {
+  return db.fieldPackages.toArray();
+}
+
+export async function getFieldPackageRecord(packageId: string): Promise<FieldPackageRecord | undefined> {
+  return db.fieldPackages.get(packageId);
+}
+
+export async function putFieldPackageRecord(record: FieldPackageRecord): Promise<void> {
+  await db.fieldPackages.put(record);
+}
+
+export async function removeFieldPackageRecord(packageId: string): Promise<void> {
+  await db.fieldPackages.delete(packageId);
+}
+
 /* ========================== 整库导入导出 ========================== */
 
 export interface DatabaseSnapshot {
@@ -497,16 +694,19 @@ export interface DatabaseSnapshot {
   steps: Step[];
   readings: Reading[];
   acceptances: Acceptance[];
+  /** v3 起随整库备份：测点台账；旧备份文件缺省时为空数组 */
+  points?: MonitorPoint[];
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [bridges, piers, bearings, steps, readings, acceptances] = await Promise.all([
+  const [bridges, piers, bearings, steps, readings, acceptances, points] = await Promise.all([
     listBridges(),
     listPiers(),
     listBearings(),
     listSteps(),
     listReadings(),
     listAcceptances(),
+    listPoints(),
   ]);
   return {
     name: DB_NAME,
@@ -518,26 +718,46 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     steps,
     readings,
     acceptances,
+    points,
   };
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [
+      db.bridges,
+      db.piers,
+      db.bearings,
+      db.steps,
+      db.points,
+      db.readings,
+      db.acceptances,
+      db.fieldFacts,
+      db.reviewItems,
+      db.importCheckpoints,
+      db.fieldPackages,
+    ],
     async () => {
+      // 整库恢复：现场合并过程表一并清空，避免旧库待复核 / 检查点污染恢复后的台账
       await Promise.all([
         db.bridges.clear(),
         db.piers.clear(),
         db.bearings.clear(),
         db.steps.clear(),
+        db.points.clear(),
         db.readings.clear(),
         db.acceptances.clear(),
+        db.fieldFacts.clear(),
+        db.reviewItems.clear(),
+        db.importCheckpoints.clear(),
+        db.fieldPackages.clear(),
       ]);
       await db.bridges.bulkPut(snapshot.bridges ?? []);
       await db.piers.bulkPut(snapshot.piers ?? []);
       await db.bearings.bulkPut(snapshot.bearings ?? []);
       await db.steps.bulkPut(snapshot.steps ?? []);
+      await db.points.bulkPut(snapshot.points ?? []);
       await db.readings.bulkPut(snapshot.readings ?? []);
       await db.acceptances.bulkPut(snapshot.acceptances ?? []);
     },
@@ -548,15 +768,32 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [
+      db.bridges,
+      db.piers,
+      db.bearings,
+      db.steps,
+      db.points,
+      db.readings,
+      db.acceptances,
+      db.fieldFacts,
+      db.reviewItems,
+      db.importCheckpoints,
+      db.fieldPackages,
+    ],
     async () => {
       await Promise.all([
         db.bridges.clear(),
         db.piers.clear(),
         db.bearings.clear(),
         db.steps.clear(),
+        db.points.clear(),
         db.readings.clear(),
         db.acceptances.clear(),
+        db.fieldFacts.clear(),
+        db.reviewItems.clear(),
+        db.importCheckpoints.clear(),
+        db.fieldPackages.clear(),
       ]);
     },
   );

@@ -12,6 +12,8 @@ export const ROUTES = {
   steps: '/steps',
   readings: '/readings',
   acceptances: '/acceptances',
+  field: '/field',
+  merge: '/merge',
 } as const;
 
 export const appRoutes: Routes = [
@@ -47,6 +49,18 @@ export const appRoutes: Routes = [
       import('../../features/acceptances/pages/acceptance-archive.page').then(
         (module) => module.AcceptanceArchivePage,
       ),
+  },
+  {
+    path: 'field',
+    title: '现场离线作业',
+    loadComponent: () =>
+      import('../../features/field/pages/field-desk.page').then((module) => module.FieldDeskPage),
+  },
+  {
+    path: 'merge',
+    title: '离线合并中心',
+    loadComponent: () =>
+      import('../../features/merge/pages/merge-center.page').then((module) => module.MergeCenterPage),
   },
   { path: '**', redirectTo: ROUTES.bridges },
 ];

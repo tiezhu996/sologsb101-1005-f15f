@@ -14,11 +14,9 @@ import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { STEP_STATE_LABEL, SYNC_REQUIREMENT_LABEL, type StepView } from '../../../core/types/step';
 import {
-  POINT_CODES,
   STRESS_ALERT_MPA,
   meanDisplacement,
   readingDateHint,
-  suggestPointCodes,
   syncDeviationMm,
   type ReadingView,
 } from '../../../core/types/reading';
@@ -26,8 +24,9 @@ import { ROUTES } from '../../../core/router/app.routes';
 import { stepActions } from '../../../core/store/step.actions';
 import { buildStepViews, selectStepStats } from '../../../core/store/step.selectors';
 import { selectBridges } from '../../../core/store/bridge.selectors';
+import { selectPoints } from '../../../core/store/offline.selectors';
 import { IdbTableService } from '../../../core/services/idb-table.service';
-import { putReadings, rowMeta, newId, type ReadingRow } from '../../../core/utils/db';
+import { putReadings, rowMeta, newId, type ReadingRow, type PointRow } from '../../../core/utils/db';
 import { formatMm, formatStress } from '../../../core/utils/unit';
 import {
   TOLERANCE_HEX,
@@ -178,6 +177,12 @@ interface BatchRow {
           <div class="gb-hint">{{ dateHint() }}</div>
 
           @if (selectedStep(); as step) {
+            @if (activePointCount() === 0) {
+              <div class="no-point-banner">
+                <mat-icon>info</mat-icon>
+                该步骤在测点台账中没有在用测点。请先到「顶升步骤编排」登记测点；已撤去测点的现场读数导入时会进入待复核区。
+              </div>
+            }
             <div class="gb-table-wrap" style="margin-top: 10px">
               <table class="gb-table">
                 <thead>
@@ -314,6 +319,17 @@ interface BatchRow {
         border-radius: 6px;
         font-size: 13px;
       }
+      .no-point-banner {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        background: #fff8e1;
+        color: #8d6e00;
+        border: 1px solid #ffe082;
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin-top: 10px;
+      }
     `,
   ],
 })
@@ -338,6 +354,9 @@ export class ReadingEntryPage {
   });
   private readonly steps: Signal<StepRow[]> = toSignal(this.store.select((state) => state.step.steps), {
     initialValue: [] as StepRow[],
+  });
+  private readonly points: Signal<PointRow[]> = toSignal(this.store.select(selectPoints), {
+    initialValue: [] as PointRow[],
   });
   private readonly readings: Signal<ReadingRow[]> = toSignal(
     this.store.select((state) => state.step.readings),
@@ -484,17 +503,26 @@ export class ReadingEntryPage {
     void this.router.navigate([], { relativeTo: this.route, queryParams, replaceUrl: true });
   }
 
-  /** 按同步要求生成测点行（同步 4 点、交叉 4 点、单点 1 点） */
+  /** 按测点台账生成录入行：只列在用测点（撤去测点不接受新读数，历史读数保留） */
   regenerateRows(): void {
     const step = this.selectedStep();
     if (!step) {
       this.batchRows.set([]);
       return;
     }
-    const codes = step.syncRequirement === 'single' ? ['P1'] : suggestPointCodes(2).slice(0, 4);
+    const codes = this.points()
+      .filter((point) => point.stepId === step.id && point.status === 'active')
+      .map((point) => point.pointCode);
     this.batchRows.set(
       codes.map((pointCode) => ({ pointCode, displacementMm: step.targetLiftMm, stressMpa: 8 })),
     );
+  }
+
+  /** 当前步骤在用测点数（无测点时提示去步骤页登记） */
+  activePointCount(): number {
+    const step = this.selectedStep();
+    if (!step) return 0;
+    return this.points().filter((point) => point.stepId === step.id && point.status === 'active').length;
   }
 
   /** 按目标顶升量填参考值（略带测点间差异，便于观察同步偏差） */
@@ -563,7 +591,12 @@ export class ReadingEntryPage {
   async submitBatch(): Promise<void> {
     const step = this.selectedStep();
     const rows = this.batchRows();
-    if (!step || rows.length === 0) return;
+    if (!step || rows.length === 0) {
+      if (this.activePointCount() === 0) {
+        this.snackBar.open('该步骤没有在用测点，请先在步骤编排页登记测点', '关闭', { duration: 2800 });
+      }
+      return;
+    }
     const recorded = this.recordedAt().replace('T', ' ');
     const payload = rows.map((row) => ({
       stepId: step.id,

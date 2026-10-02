@@ -20,6 +20,10 @@ import {
 import { selectBridgeStats } from './core/store/bridge.selectors';
 import { selectStepStats } from './core/store/step.selectors';
 import { selectAcceptanceStats } from './core/store/acceptance.selectors';
+import {
+  selectOpenReviewCount,
+  selectPendingCheckpointCount,
+} from './core/store/offline.selectors';
 import { ROUTES } from './core/router/app.routes';
 
 interface NavItem {
@@ -57,6 +61,16 @@ interface NavItem {
         <mat-chip highlighted>待换支座 {{ bearingStats().pending }} 个</mat-chip>
         <mat-chip highlighted>顶升级数 {{ stepStats().total }}</mat-chip>
         <mat-chip highlighted>验收合格 {{ acceptanceStats().pass }} 条</mat-chip>
+        @if (openReviewCount() > 0) {
+          <a [routerLink]="ROUTES.merge" class="app-alert-link">
+            <mat-chip highlighted class="app-review-chip">待复核 {{ openReviewCount() }} 条</mat-chip>
+          </a>
+        }
+        @if (pendingCheckpointCount() > 0) {
+          <a [routerLink]="ROUTES.merge" class="app-alert-link">
+            <mat-chip highlighted class="app-review-chip">导入失败待重试 {{ pendingCheckpointCount() }}</mat-chip>
+          </a>
+        }
       </mat-chip-set>
     </mat-toolbar>
 
@@ -123,6 +137,14 @@ interface NavItem {
         background: #ffebee !important;
         color: #b71c1c !important;
       }
+      .app-review-chip {
+        background: #fff3e0 !important;
+        color: #e65100 !important;
+      }
+      .app-alert-link {
+        text-decoration: none;
+        cursor: pointer;
+      }
       .app-shell {
         height: calc(100vh - 64px);
         background: var(--gb-bg);
@@ -176,12 +198,16 @@ export class AppComponent implements OnInit {
   private readonly idb = inject(IdbTableService);
   private readonly destroyRef = inject(DestroyRef);
 
+  readonly ROUTES = ROUTES;
+
   readonly navItems: NavItem[] = [
     { path: ROUTES.bridges, label: '桥梁与墩台', icon: 'foundation' },
     { path: ROUTES.bearings, label: '支座与评级', icon: 'view_module' },
     { path: ROUTES.steps, label: '顶升步骤编排', icon: 'stairs' },
     { path: ROUTES.readings, label: '测点读数录入', icon: 'monitor_heart' },
     { path: ROUTES.acceptances, label: '分步验收与归档', icon: 'fact_check' },
+    { path: ROUTES.field, label: '现场离线作业', icon: 'tablet_mac' },
+    { path: ROUTES.merge, label: '离线合并中心', icon: 'merge' },
   ];
 
   /** 顶栏与侧栏统计：全部来自 NgRx select */
@@ -204,6 +230,10 @@ export class AppComponent implements OnInit {
   });
   readonly acceptanceStats = toSignal(this.store.select(selectAcceptanceStats), {
     initialValue: { total: 0, pass: 0, fail: 0, byStage: [] },
+  });
+  readonly openReviewCount = toSignal(this.store.select(selectOpenReviewCount), { initialValue: 0 });
+  readonly pendingCheckpointCount = toSignal(this.store.select(selectPendingCheckpointCount), {
+    initialValue: 0,
   });
 
   /** 错误提示（写入失败等） */

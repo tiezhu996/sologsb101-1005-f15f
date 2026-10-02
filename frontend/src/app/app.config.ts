@@ -9,6 +9,7 @@ import { bridgeReducer } from './core/store/bridge.reducer';
 import { bearingReducer } from './core/store/bearing.reducer';
 import { stepReducer } from './core/store/step.reducer';
 import { acceptanceReducer } from './core/store/acceptance.reducer';
+import { offlineReducer } from './core/store/offline.reducer';
 import { AppEffects } from './core/store/app.effects';
 
 /**
@@ -27,6 +28,7 @@ export const appConfig: ApplicationConfig = {
       bearing: bearingReducer,
       step: stepReducer,
       acceptance: acceptanceReducer,
+      offline: offlineReducer,
     }),
     provideEffects([AppEffects]),
     provideStoreDevtools({ maxAge: 25, logOnly: !isDevMode() }),

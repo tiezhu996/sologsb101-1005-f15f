@@ -28,6 +28,7 @@ import {
   type StepView,
   type SyncRequirement,
 } from '../../../core/types/step';
+import { POINT_STATUS_LABEL } from '../../../core/types/point';
 import { ROUTES } from '../../../core/router/app.routes';
 import { stepActions } from '../../../core/store/step.actions';
 import {
@@ -38,12 +39,15 @@ import {
   selectSyncLevels,
 } from '../../../core/store/step.selectors';
 import { selectBridges } from '../../../core/store/bridge.selectors';
+import { selectPoints } from '../../../core/store/offline.selectors';
+import { offlineActions } from '../../../core/store/offline.actions';
+import { buildPointViews } from '../../../core/store/offline.selectors';
 import { formatLift, formatMm, share } from '../../../core/utils/unit';
 import { TOLERANCE_HEX, TOLERANCE_LEVEL_LABEL } from '../../../core/utils/tolerance';
 import { StatBadgeComponent } from '../../../shared/components/common/stat-badge.component';
 import { EmptyPanelComponent } from '../../../shared/components/common/empty-panel.component';
 import { FilterBarComponent, type FilterSelectSpec } from '../../../shared/components/common/filter-bar.component';
-import type { BridgeRow, ReadingRow, StepRow } from '../../../core/utils/db';
+import type { BridgeRow, ReadingRow, StepRow, PointRow } from '../../../core/utils/db';
 import type { ToleranceLevel } from '../../../core/utils/tolerance';
 
 /** 顶升步骤表单对话框数据 */
@@ -337,6 +341,56 @@ export class StepDialogComponent {
 
     <mat-card appearance="outlined" class="gb-section">
       <div style="padding: 12px 14px">
+        <div class="gb-card-title">测点台账（主台账稳定挂接单元）</div>
+        <div class="gb-hint" style="margin: 6px 0">
+          现场包按测点稳定编号挂接读数；撤去测点只停用挂接、不删历史读数，该测点之后的现场读数会在导入时进待复核区。
+        </div>
+        @if (filtered().length === 0) {
+          <div class="gb-hint">当前筛选下没有步骤。</div>
+        } @else {
+          <div class="point-list">
+            @for (step of filtered(); track step.id) {
+              <div class="point-group">
+                <div class="point-group-head">
+                  <mat-chip highlighted>{{ step.bridgeName }} · #{{ step.seq }}</mat-chip>
+                  <span class="gb-hint">目标 {{ step.targetLiftMm }} mm · {{ syncRequirementLabel[step.syncRequirement] }}</span>
+                </div>
+                <div class="gb-tags">
+                  @for (point of pointsOf(step.id); track point.id) {
+                    <mat-chip [class]="'point-' + point.status" [matTooltip]="point.location + '（' + pointStatusLabel[point.status] + '）'">
+                      {{ point.pointCode }} · {{ pointStatusLabel[point.status] }}
+                      <button matTooltip="撤去 / 恢复" class="point-act" (click)="point.status === 'active' ? retirePoint(point.id) : activatePoint(point.id)">
+                        <mat-icon>{{ point.status === 'active' ? 'link_off' : 'add_link' }}</mat-icon>
+                      </button>
+                      <button matTooltip="删除测点" class="point-act" (click)="deletePoint(point.id)">
+                        <mat-icon>close</mat-icon>
+                      </button>
+                    </mat-chip>
+                  }
+                </div>
+                <div class="point-add">
+                  <mat-form-field appearance="outline" style="width: 130px">
+                    <mat-label>测点编号</mat-label>
+                    <input matInput [ngModel]="newPointCode()[step.id] || ''" (ngModelChange)="setNewPointCode(step.id, $event)" placeholder="如 J1" />
+                  </mat-form-field>
+                  <mat-form-field appearance="outline" style="flex: 1; min-width: 200px">
+                    <mat-label>布置位置</mat-label>
+                    <input matInput [ngModel]="newPointLocation()[step.id] || ''" (ngModelChange)="setNewPointLocation(step.id, $event)" placeholder="如 大里程左侧" />
+                  </mat-form-field>
+                  <button mat-stroked-button color="primary" (click)="addPoint(step)">
+                    <mat-icon>add</mat-icon>
+                    登记测点
+                  </button>
+                </div>
+              </div>
+            }
+          </div>
+        }
+      </div>
+    </mat-card>
+
+    <mat-card appearance="outlined" class="gb-section">
+      <div style="padding: 12px 14px">
         <div class="gb-card-title">同步要求布置建议</div>
         <div class="gb-tags" style="margin-top: 8px">
           @for (hint of syncHints(); track hint.id) {
@@ -359,6 +413,50 @@ export class StepDialogComponent {
       mat-chip.state-arrived {
         background: #e8f5e9 !important;
         color: #1b5e20 !important;
+      }
+      .point-list {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .point-group {
+        border: 1px solid #e3e8ef;
+        border-radius: 8px;
+        padding: 10px 12px;
+      }
+      .point-group-head {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 6px;
+      }
+      .point-add {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin-top: 6px;
+      }
+      mat-chip.point-active {
+        background: #e3f2fd !important;
+        color: #0d47a1 !important;
+      }
+      mat-chip.point-retired {
+        background: #efebe9 !important;
+        color: #6d4c41 !important;
+      }
+      .point-act {
+        border: none;
+        background: transparent;
+        cursor: pointer;
+        color: inherit;
+        display: inline-flex;
+        padding: 0 2px;
+      }
+      .point-act mat-icon {
+        font-size: 15px;
+        width: 15px;
+        height: 15px;
       }
     `,
   ],
@@ -386,6 +484,9 @@ export class StepPlanPage {
     this.store.select((state) => state.step.readings),
     { initialValue: [] as ReadingRow[] },
   );
+  private readonly points: Signal<PointRow[]> = toSignal(this.store.select(selectPoints), {
+    initialValue: [] as PointRow[],
+  });
   readonly activeBridgeId = toSignal(this.store.select((state) => state.step.activeBridgeId), {
     initialValue: null as string | null,
   });
@@ -411,6 +512,19 @@ export class StepPlanPage {
   readonly stepViews: Signal<StepView[]> = computed(() =>
     buildStepViews(this.steps(), this.readings(), this.bridges()),
   );
+
+  readonly pointStatusLabel = POINT_STATUS_LABEL;
+
+  /** 测点台账视图（主台账归属，按桥梁 → 步骤序号排序） */
+  readonly pointViews = computed(() =>
+    buildPointViews(this.points(), this.steps(), this.bridges(), this.readings()).sort((a, b) =>
+      a.bridgeName === b.bridgeName ? a.stepSeq - b.stepSeq : a.bridgeName.localeCompare(b.bridgeName),
+    ),
+  );
+
+  /** 新增测点的草稿（key = stepId） */
+  readonly newPointCode = signal<Record<string, string>>({});
+  readonly newPointLocation = signal<Record<string, string>>({});
 
   readonly keyword = signal('');
   readonly filters = signal<Record<string, string[]>>({ bridge: [], state: [], sync: [] });
@@ -569,6 +683,56 @@ export class StepPlanPage {
     if (!confirm(`确认删除步骤 #${step.seq}（目标 ${step.targetLiftMm} mm）及其测点读数？`)) return;
     this.store.dispatch(stepActions.deleteStep({ id: step.id }));
     this.notify('顶升步骤及其读数已删除');
+  }
+
+  /* ============================ 测点台账（主台账归属） ============================ */
+
+  /** 当前步骤下的测点（在用在前） */
+  pointsOf(stepId: string) {
+    return this.pointViews()
+      .filter((point) => point.stepId === stepId)
+      .sort((a, b) => (a.status === b.status ? a.pointCode.localeCompare(b.pointCode) : a.status === 'active' ? -1 : 1));
+  }
+
+  setNewPointCode(stepId: string, value: string): void {
+    this.newPointCode.set({ ...this.newPointCode(), [stepId]: value });
+  }
+
+  setNewPointLocation(stepId: string, value: string): void {
+    this.newPointLocation.set({ ...this.newPointLocation(), [stepId]: value });
+  }
+
+  addPoint(step: StepView): void {
+    const code = (this.newPointCode()[step.id] ?? '').trim();
+    if (!code) {
+      this.notify('请填写测点编号');
+      return;
+    }
+    this.store.dispatch(
+      offlineActions.createPoint({
+        draft: {
+          stepId: step.id,
+          pointCode: code,
+          location: (this.newPointLocation()[step.id] ?? '').trim() || `测点 ${code}`,
+        },
+      }),
+    );
+    this.newPointCode.set({ ...this.newPointCode(), [step.id]: '' });
+    this.newPointLocation.set({ ...this.newPointLocation(), [step.id]: '' });
+  }
+
+  retirePoint(pointId: string): void {
+    if (!confirm('撤去该测点？历史读数保留，但此后现场包中对该测点的读数将进待复核区。')) return;
+    this.store.dispatch(offlineActions.retirePoint({ id: pointId }));
+  }
+
+  activatePoint(pointId: string): void {
+    this.store.dispatch(offlineActions.activatePoint({ id: pointId }));
+  }
+
+  deletePoint(pointId: string): void {
+    if (!confirm('确认删除该测点？（历史读数仍保留在台账中）')) return;
+    this.store.dispatch(offlineActions.deletePoint({ id: pointId }));
   }
 
   onKeyword(value: string): void {

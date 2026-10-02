@@ -18,6 +18,9 @@ import {
   listPiers,
   listReadings,
   listSteps,
+  listPoints,
+  listReviewItems,
+  listImportCheckpoints,
   newId,
   putAcceptance,
   putBearing,
@@ -26,22 +29,33 @@ import {
   putPier,
   putStep,
   putSteps,
+  putPoint,
+  putPoints,
   removeAcceptance,
   removeBearing,
   removeBridge,
   removePier,
   removeStep,
+  retirePoint,
+  activatePoint,
+  removePoint,
+  updateReviewStatus,
+  removeReviewItem,
   rowMeta,
 } from '../utils/db';
 import type { AcceptanceRow } from '../utils/db';
 import { escalateGrade } from '../types/bearing';
 import { resequenceSteps } from '../types/step';
+import { defaultPointsFor } from '../types/point';
 import { checkBridgeArchived } from './archive.helper';
+import { offlineActions } from './offline.actions';
+import { FieldImportService } from '../services/field-import.service';
 
 @Injectable()
 export class AppEffects {
   private readonly actions$ = inject(Actions);
   private readonly idb = inject(IdbTableService);
+  private readonly fieldImport = inject(FieldImportService);
 
   /** 应用初始化 / 数据变更后：一次性加载全部表并分发给各 feature store */
   readonly loadAll$ = createEffect(() =>
@@ -56,10 +70,14 @@ export class AppEffects {
             listSteps(),
             listReadings(),
             listAcceptances(),
+            listPoints(),
+            listReviewItems(),
+            listImportCheckpoints(),
           ]),
         ).pipe(
-          map(([bridges, piers, bearings, steps, readings, acceptances]) =>
-            appDataLoaded({ bridges, piers, bearings, steps, readings, acceptances }),
+          map(
+            ([bridges, piers, bearings, steps, readings, acceptances, points, reviewItems, checkpoints]) =>
+              appDataLoaded({ bridges, piers, bearings, steps, readings, acceptances, points, reviewItems, checkpoints }),
           ),
           catchError((error: unknown) =>
             from([
@@ -453,8 +471,9 @@ export class AppEffects {
             (async () => {
               const existing = (await listSteps()).filter((item) => item.bridgeId === draft.bridgeId);
               const seq = existing.reduce((max, item) => Math.max(max, item.seq), 0) + 1;
+              const stepId = newId('step');
               await putStep({
-                id: newId('step'),
+                id: stepId,
                 bridgeId: draft.bridgeId,
                 seq,
                 targetLiftMm: draft.targetLiftMm,
@@ -464,6 +483,18 @@ export class AppEffects {
                 state: 'idle',
                 ...rowMeta(),
               });
+              // 主台账自动登记默认测点（单点 1 个，同步 / 交叉四角），后续可增删 / 撤去
+              const pointCodes = defaultPointsFor(draft.syncRequirement);
+              await putPoints(
+                pointCodes.map((code, index) => ({
+                  id: newId('point'),
+                  stepId,
+                  pointCode: `${code}`,
+                  location: `默认测点 ${code}（${index + 1}）`,
+                  status: 'active' as const,
+                  ...rowMeta(),
+                })),
+              );
               this.idb.emitChange();
             })(),
           ).pipe(
@@ -733,6 +764,218 @@ export class AppEffects {
             catchError((error: unknown) =>
               from([
                 writeFailed({ message: error instanceof Error ? error.message : '归档失败' }),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    { dispatch: true },
+  );
+
+  /** 测点：新建（默认在用） */
+  readonly createPoint$ = createEffect(
+    () =>
+      this.actions$.pipe(
+        ofType(offlineActions.createPoint),
+        switchMap(({ draft }) =>
+          from(
+            putPoint({
+              id: newId('point'),
+              stepId: draft.stepId,
+              pointCode: draft.pointCode.trim(),
+              location: draft.location.trim(),
+              status: 'active',
+              ...rowMeta(),
+            }),
+          ).pipe(
+            map(() => {
+              this.idb.emitChange();
+              return writeSucceeded({ message: '测点已登记' });
+            }),
+            catchError((error: unknown) =>
+              from([
+                writeFailed({ message: error instanceof Error ? error.message : '登记测点失败' }),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    { dispatch: true },
+  );
+
+  /** 测点：撤去（历史读数保留） */
+  readonly retirePoint$ = createEffect(
+    () =>
+      this.actions$.pipe(
+        ofType(offlineActions.retirePoint),
+        switchMap(({ id }) =>
+          from(retirePoint(id)).pipe(
+            map(() => {
+              this.idb.emitChange();
+              return writeSucceeded({ message: '测点已撤去，历史读数保留；新读数将进待复核区' });
+            }),
+            catchError((error: unknown) =>
+              from([
+                writeFailed({ message: error instanceof Error ? error.message : '撤去测点失败' }),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    { dispatch: true },
+  );
+
+  /** 测点：恢复在用 */
+  readonly activatePoint$ = createEffect(
+    () =>
+      this.actions$.pipe(
+        ofType(offlineActions.activatePoint),
+        switchMap(({ id }) =>
+          from(activatePoint(id)).pipe(
+            map(() => {
+              this.idb.emitChange();
+              return writeSucceeded({ message: '测点已恢复在用' });
+            }),
+            catchError((error: unknown) =>
+              from([
+                writeFailed({ message: error instanceof Error ? error.message : '恢复测点失败' }),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    { dispatch: true },
+  );
+
+  /** 测点：删除测点 */
+  readonly deletePoint$ = createEffect(
+    () =>
+      this.actions$.pipe(
+        ofType(offlineActions.deletePoint),
+        switchMap(({ id }) =>
+          from(removePoint(id)).pipe(
+            map(() => {
+              this.idb.emitChange();
+              return writeSucceeded({ message: '测点已删除' });
+            }),
+            catchError((error: unknown) =>
+              from([
+                writeFailed({ message: error instanceof Error ? error.message : '删除测点失败' }),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    { dispatch: true },
+  );
+
+  /** 待复核：标记已处理 */
+  readonly resolveReview$ = createEffect(
+    () =>
+      this.actions$.pipe(
+        ofType(offlineActions.resolveReview),
+        switchMap(({ id, resolution }) =>
+          from(updateReviewStatus(id, 'resolved', resolution)).pipe(
+            map(() => {
+              this.idb.emitChange();
+              return writeSucceeded({ message: '待复核记录已处理' });
+            }),
+            catchError((error: unknown) =>
+              from([
+                writeFailed({ message: error instanceof Error ? error.message : '处理待复核记录失败' }),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    { dispatch: true },
+  );
+
+  /** 待复核：重新打开 */
+  readonly reopenReview$ = createEffect(
+    () =>
+      this.actions$.pipe(
+        ofType(offlineActions.reopenReview),
+        switchMap(({ id }) =>
+          from(updateReviewStatus(id, 'open', '')).pipe(
+            map(() => {
+              this.idb.emitChange();
+              return writeSucceeded({ message: '待复核记录已重新打开' });
+            }),
+            catchError((error: unknown) =>
+              from([
+                writeFailed({ message: error instanceof Error ? error.message : '重新打开失败' }),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    { dispatch: true },
+  );
+
+  /** 待复核：删除 */
+  readonly deleteReview$ = createEffect(
+    () =>
+      this.actions$.pipe(
+        ofType(offlineActions.deleteReview),
+        switchMap(({ id }) =>
+          from(removeReviewItem(id)).pipe(
+            map(() => {
+              this.idb.emitChange();
+              return writeSucceeded({ message: '待复核记录已删除' });
+            }),
+            catchError((error: unknown) =>
+              from([
+                writeFailed({ message: error instanceof Error ? error.message : '删除待复核记录失败' }),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    { dispatch: true },
+  );
+
+  /** 检查点：重试导入（同一包重试不重复生成读数 / 验收） */
+  readonly retryCheckpoint$ = createEffect(
+    () =>
+      this.actions$.pipe(
+        ofType(offlineActions.retryCheckpoint),
+        switchMap(({ id }) =>
+          from(this.fieldImport.retry(id)).pipe(
+            map(() => {
+              this.idb.emitChange();
+              return writeSucceeded({ message: '检查点重试成功，现场事实已合并' });
+            }),
+            catchError((error: unknown) => {
+              this.idb.emitChange();
+              return from([
+                writeFailed({
+                  message: error instanceof Error
+                    ? `重试仍失败，检查点已保留：${error.message}`
+                    : '重试失败，检查点已保留',
+                }),
+              ]);
+            }),
+          ),
+        ),
+      ),
+    { dispatch: true },
+  );
+
+  /** 检查点：放弃（标记 abandoned 留档） */
+  readonly abandonCheckpoint$ = createEffect(
+    () =>
+      this.actions$.pipe(
+        ofType(offlineActions.abandonCheckpoint),
+        switchMap(({ id }) =>
+          from(this.fieldImport.abandon(id)).pipe(
+            map(() => {
+              this.idb.emitChange();
+              return writeSucceeded({ message: '检查点已放弃' });
+            }),
+            catchError((error: unknown) =>
+              from([
+                writeFailed({ message: error instanceof Error ? error.message : '放弃检查点失败' }),
               ]),
             ),
           ),

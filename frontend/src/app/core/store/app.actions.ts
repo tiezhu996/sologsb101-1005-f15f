@@ -11,6 +11,9 @@ import type {
   PierRow,
   ReadingRow,
   StepRow,
+  PointRow,
+  ReviewItemRow,
+  ImportCheckpointRow,
 } from '../utils/db';
 
 export const appInit = createAction('[app] init');
@@ -24,6 +27,9 @@ export const appDataLoaded = createAction(
     steps: StepRow[];
     readings: ReadingRow[];
     acceptances: AcceptanceRow[];
+    points: PointRow[];
+    reviewItems: ReviewItemRow[];
+    checkpoints: ImportCheckpointRow[];
   }>(),
 );
 
