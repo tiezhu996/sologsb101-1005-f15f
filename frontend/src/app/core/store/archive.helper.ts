@@ -5,6 +5,7 @@
 import { listAcceptances, listBearings, listBridges, listPiers, listReadings, listSteps } from '../utils/db';
 import { ACCEPTANCE_STAGES } from '../types/acceptance';
 import { archiveSummary } from '../types/acceptance';
+import { bridgeIdsBlockedByOrphans } from '../utils/field-merge';
 
 export interface ArchiveCheckResult {
   /** 已满足归档条件的桥梁 id */
@@ -13,21 +14,27 @@ export interface ArchiveCheckResult {
   summaries: string[];
 }
 
-/** 检查全部桥梁的归档条件 */
+/**
+ * 检查全部桥梁的归档条件。
+ * 放行规则：四步验收全合格，且不存在来源不明的现场待复核记录
+ *（主台账重排步骤不影响；替换支座 / 撤去测点 / 删步骤产生的孤儿必须先处理）。
+ */
 export async function checkBridgeArchived(): Promise<ArchiveCheckResult> {
-  const [bridges, piers, bearings, acceptances, steps, readings] = await Promise.all([
+  const [bridges, piers, bearings, acceptances, steps, readings, blockedBridgeIds] = await Promise.all([
     listBridges(),
     listPiers(),
     listBearings(),
     listAcceptances(),
     listSteps(),
     listReadings(),
+    bridgeIdsBlockedByOrphans(),
   ]);
 
   const archivableBridgeIds: string[] = [];
   const summaries: string[] = [];
 
   for (const bridge of bridges) {
+    if (blockedBridgeIds.has(bridge.id)) continue;
     const pierIds = new Set(piers.filter((item) => item.bridgeId === bridge.id).map((item) => item.id));
     const ownedBearings = bearings.filter((item) => pierIds.has(item.pierId));
     if (ownedBearings.length === 0) continue;

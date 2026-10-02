@@ -182,6 +182,7 @@ export class AppComponent implements OnInit {
     { path: ROUTES.steps, label: '顶升步骤编排', icon: 'stairs' },
     { path: ROUTES.readings, label: '测点读数录入', icon: 'monitor_heart' },
     { path: ROUTES.acceptances, label: '分步验收与归档', icon: 'fact_check' },
+    { path: ROUTES.field, label: '现场包离线合并', icon: 'sync_alt' },
   ];
 
   /** 顶栏与侧栏统计：全部来自 NgRx select */

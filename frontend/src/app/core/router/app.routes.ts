@@ -1,6 +1,6 @@
 /**
- * 路由表（路径与项目提示词逐字一致）
- * /bridges、/bearings、/steps、/readings、/acceptances
+ * 路由表
+ * /bridges、/bearings、/steps、/readings、/acceptances、/field（现场包离线合并）
  * 组件按路由懒加载，构建时自动分包。
  */
 import type { Routes } from '@angular/router';
@@ -12,6 +12,8 @@ export const ROUTES = {
   steps: '/steps',
   readings: '/readings',
   acceptances: '/acceptances',
+  field: '/field',
+  fieldTablet: '/field/tablet',
 } as const;
 
 export const appRoutes: Routes = [
@@ -47,6 +49,18 @@ export const appRoutes: Routes = [
       import('../../features/acceptances/pages/acceptance-archive.page').then(
         (module) => module.AcceptanceArchivePage,
       ),
+  },
+  {
+    path: 'field/tablet',
+    title: '平板现场登记',
+    loadComponent: () =>
+      import('../../features/field/pages/field-tablet.page').then((module) => module.FieldTabletPage),
+  },
+  {
+    path: 'field',
+    title: '现场包离线合并',
+    loadComponent: () =>
+      import('../../features/field/pages/field-merge.page').then((module) => module.FieldMergePage),
   },
   { path: '**', redirectTo: ROUTES.bridges },
 ];

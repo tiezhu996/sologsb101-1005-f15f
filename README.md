@@ -28,6 +28,7 @@ docker compose up -d --build # 代码改动后重建
 - 编排分级顶升步骤（目标顶升量、同步要求、限位值、负责人），支持上移 / 下移调序与**累计顶升量校验**
 - 按步骤批量录入多测点位移与应力，实时计算**同步偏差**（同批次极差）并按限位值给出告警
 - 四步签署验收（顶升到位 → 支座就位 → 落梁 → 竣工），全部支座合格后可执行竣工归档
+- **现场包离线合并**：项目部按桥发放含稳定编号锚点的现场包，平板断网登记步骤状态 / 读数 / 验收，回部后按稳定编号（非步骤序号）重新挂接；替换支座、撤去测点产生的无归属记录进**待复核区**，处理前不放行归档；导入失败保留检查点可重试，同一包重复导入幂等不重复
 - 查看 IndexedDB 结构版本并导出 / 导入整库 JSON
 
 本项目为**纯前端单页应用**：无后端、无数据库服务、无外部接口，全部数据保存在浏览器 IndexedDB。
@@ -55,6 +56,8 @@ docker compose up -d --build # 代码改动后重建
 | `/steps` | `StepPlanPage` | 顶升步骤编排、顺序调整与累计顶升量校验 |
 | `/readings` | `ReadingEntryPage` | 按步骤批量录入位移与应力，同步偏差与限位告警 |
 | `/acceptances` | `AcceptanceArchivePage` | 四步签署、竣工归档与结构版本 JSON 导出 / 导入 |
+| `/field` | `FieldMergePage` | 项目部：发放现场包、离线合并、检查点重试、待复核区、测点台账 |
+| `/field/tablet` | `FieldTabletPage` | 平板：载入现场包断网登记执行事实，导出回填包 |
 
 > 路由定义在 `src/app/core/router/app.routes.ts`，使用默认的 `PathLocationStrategy`（history 模式），与 nginx 的 `try_files $uri $uri/ /index.html` 配合，直接访问上述深链接（含刷新）都能命中对应页面。
 
@@ -80,25 +83,26 @@ sologsb101-1005/
             ├── app.component.ts          # 应用外壳（工具栏 + 侧边导航 + 统计）
             ├── app.config.ts             # provideRouter / provideStore / provideEffects
             ├── core/
-            │   ├── types/                # bridge.ts pier.ts bearing.ts step.ts reading.ts acceptance.ts persistence.ts
+            │   ├── types/                # bridge.ts pier.ts bearing.ts step.ts reading.ts acceptance.ts persistence.ts field-package.ts
             │   ├── store/                # app.actions.ts notice.reducer.ts archive.helper.ts
             │   │                         # bridge.store/reducer/selectors、bearing.*、step.*、acceptance.*、app.effects.ts
-            │   ├── services/             # idb-table.service.ts step-timeline.service.ts change-bus.service.ts
+            │   ├── services/             # idb-table.service.ts step-timeline.service.ts change-bus.service.ts field-sync.service.ts
             │   ├── router/app.routes.ts
-            │   └── utils/                # unit.ts tolerance.ts db.ts export.ts
+            │   └── utils/                # unit.ts tolerance.ts db.ts export.ts field-merge.ts
             ├── shared/components/common/ # grade-tag / filter-bar / stat-badge / empty-panel
             └── features/
                 ├── bridges/pages/bridge-list.page.ts
                 ├── bearings/pages/bearing-board.page.ts
                 ├── steps/pages/step-plan.page.ts
                 ├── readings/pages/reading-entry.page.ts
-                └── acceptances/pages/acceptance-archive.page.ts
+                ├── acceptances/pages/acceptance-archive.page.ts
+                └── field/pages/          # field-merge.page.ts（项目部）/ field-tablet.page.ts（平板）
 ```
 
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbbridgebear`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`core/utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `span → spanCombo`、`grade → diseaseGrade`、`syncType → syncRequirement`、`limit → limitMm`，新增 `settings` 表）。
+- **数据结构版本**：`core/utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记 v1 → v2（补齐行修订号、迁移 `span → spanCombo`、`grade → diseaseGrade`、`syncType → syncRequirement`、`limit → limitMm`，新增 `settings` 表）与 v2 → v3（现场包离线合并：新增 `points / fieldOrphans / importBatches / fieldDrafts` 表，读数补 `pointId`、验收补 `sourcePackageId`，既有读数反推测点台账）的 `upgrade` 迁移。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -107,9 +111,20 @@ sologsb101-1005/
   | `piers` | 墩台 | id / bridgeId / code / capElevation / [bridgeId+code] |
   | `bearings` | 支座 | id / pierId / diseaseGrade / type / serial / [pierId+serial] |
   | `steps` | 顶升步骤 | id / bridgeId / seq / state / syncRequirement / [bridgeId+seq] |
-  | `readings` | 测点读数 | id / stepId / pointCode / recordedAt / [stepId+pointCode] |
-  | `acceptances` | 分步验收 | id / bearingId / stage / conclusion / [bearingId+stage] |
+  | `readings` | 测点读数 | id / stepId / pointId / pointCode / recordedAt / [stepId+pointCode] |
+  | `acceptances` | 分步验收 | id / bearingId / stage / conclusion / sourcePackageId / [bearingId+stage] |
+  | `points` | 测点布设计划（主台账归属，可软撤） | id / stepId / pointCode / active / [stepId+pointCode] |
+  | `fieldOrphans` | 待复核区现场事实 | id / packageId / bridgeId / kind / reason / status / [bridgeId+status] |
+  | `importBatches` | 现场包导入批次与失败检查点 | packageId / bridgeId / status / importedAt |
+  | `fieldDrafts` | 平板断网登记草稿 | packageId / bridgeId / updatedAt |
   | `settings` | 自定义字典 | id |
+
+- **现场包离线合并规则**（`core/utils/field-merge.ts`、`core/types/field-package.ts`）：
+  - 主台账是桥梁 / 墩台 / 支座 / 步骤顺序 / 测点布设的**归属方**，现场包只提交执行事实（步骤状态、读数、验收）；
+  - 挂接按发放时固化的**稳定编号**（`stepId / bearingId / pointId`），步骤 `seq` 仅作平板展示，主台账重排步骤不影响读数落位；
+  - 替换支座、撤去测点（`points.active=0` 软删，历史读数保留）、删除步骤导致无归属的事实进 `fieldOrphans` 待复核区并记录来源包 / 设备；
+  - 单事务合并，失败整体回滚并把整包原文存入 `importBatches`（failed 检查点），可在页面重试；以 `packageId` 为幂等键，重复导入不重复生成读数 / 验收，主台账已有内容保留；
+  - 桥梁存在 pending 待复核记录时，验收页「竣工归档」与 `checkBridgeArchived()` 自动判定均不放行。
 
 - **首屏自动播种**：`initDatabase()` 在 `bridges` 表为空时写入演示数据（幂等）——2 座桥梁 × 各 2~3 个墩台 × 各 2~3 个支座（四级病害各覆盖）+ 2~3 级顶升步骤 + 每级多测点读数 + 分步验收记录，父子记录通过 `bridgeId / pierId / bearingId / stepId` 互相引用。
 - **跨页状态**：全部放在 NgRx store（`bridge / bearing / step / acceptance` + `notice` 提示），页面只通过 `select` 读 store、通过 `dispatch` 写；Dexie 写入后由 `ChangeBusService` 广播，`AppEffects` 重新加载全部表。

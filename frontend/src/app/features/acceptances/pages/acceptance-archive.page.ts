@@ -51,6 +51,7 @@ import {
   type DatabaseSnapshot,
 } from '../../../core/utils/db';
 import { backupFilename, downloadCsv, downloadJson, nowDateTime, readJsonFile } from '../../../core/utils/export';
+import { pendingOrphanCountOfBridge } from '../../../core/utils/field-merge';
 import { share } from '../../../core/utils/unit';
 import { IdbTableService } from '../../../core/services/idb-table.service';
 import { StatBadgeComponent } from '../../../shared/components/common/stat-badge.component';
@@ -658,7 +659,7 @@ export class AcceptanceArchivePage {
     this.notify('验收记录已删除');
   }
 
-  archiveActive(archived: boolean): void {
+  async archiveActive(archived: boolean): Promise<void> {
     const bridgeId = this.activeBridgeId();
     if (!bridgeId) return;
     const bridge = this.bridges().find((item) => item.id === bridgeId);
@@ -671,6 +672,12 @@ export class AcceptanceArchivePage {
       readingCount: this.stepStats().readingCount,
     });
     if (archived) {
+      // 闸门 1：现场待复核记录未处理前不放行整桥归档
+      const pendingOrphans = await pendingOrphanCountOfBridge(bridgeId);
+      if (pendingOrphans > 0) {
+        this.notify(`不满足归档条件：该桥有 ${pendingOrphans} 条现场记录在待复核区，请先到「现场包离线合并」处理`);
+        return;
+      }
       const pierIds = new Set(this.piers().filter((item) => item.bridgeId === bridgeId).map((item) => item.id));
       const owned = this.bearingRows().filter((bearing) => pierIds.has(bearing.pierId));
       const passCount = owned.filter((bearing) => this.fullyAccepted(bearing.id)).length;

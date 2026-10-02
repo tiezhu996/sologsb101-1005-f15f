@@ -15,6 +15,10 @@ export interface Reading extends RowMeta {
   recordedAt: string;
   /** 记录人 */
   operator: string;
+  /** 测点稳定编号（对应 points 表；现场包导入与手动录入均写入，便于撤点后指认） */
+  pointId?: string;
+  /** 来源现场包稳定编号（现场包合并产生的读数回指来源；主台账手动录入为空） */
+  sourcePackageId?: string;
 }
 
 /** 测点读数表单草稿 */

@@ -34,6 +34,8 @@ export interface Acceptance extends RowMeta {
   acceptor: string;
   /** 验收时间 yyyy-MM-dd HH:mm */
   acceptedAt: string;
+  /** 来源现场包稳定编号（现场包合并产生的验收回指来源；主台账手动签署为空） */
+  sourcePackageId?: string;
 }
 
 /** 验收表单草稿 */

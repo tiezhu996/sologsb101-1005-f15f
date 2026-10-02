@@ -13,12 +13,19 @@ import type { Step, SyncRequirement } from '../types/step';
 import type { Reading } from '../types/reading';
 import type { Acceptance, AcceptanceStage } from '../types/acceptance';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
+import type {
+  FieldDraftRow,
+  FieldImportBatchRow,
+  FieldOrphanRow,
+  PointRow,
+} from '../types/field-package';
+import { pointIdOf } from '../types/field-package';
 
 /** 浏览器 IndexedDB 库名 */
 export const DB_NAME = 'gbbridgebear';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -29,6 +36,10 @@ export type BearingRow = Bearing;
 export type StepRow = Step;
 export type ReadingRow = Reading;
 export type AcceptanceRow = Acceptance;
+export type PointDbRow = PointRow;
+export type FieldOrphanDbRow = FieldOrphanRow;
+export type FieldImportBatchDbRow = FieldImportBatchRow;
+export type FieldDraftDbRow = FieldDraftRow;
 
 class BridgeBearingDatabase extends Dexie {
   bridges!: Table<BridgeRow, string>;
@@ -37,6 +48,14 @@ class BridgeBearingDatabase extends Dexie {
   steps!: Table<StepRow, string>;
   readings!: Table<ReadingRow, string>;
   acceptances!: Table<AcceptanceRow, string>;
+  /** 测点布设计划（主台账归属，可软撤） */
+  points!: Table<PointDbRow, string>;
+  /** 待复核区：找不到归属的现场执行事实 */
+  fieldOrphans!: Table<FieldOrphanDbRow, string>;
+  /** 现场包导入批次与失败检查点（整包原文 + 状态，支持重试与幂等） */
+  importBatches!: Table<FieldImportBatchDbRow, string>;
+  /** 平板现场登记草稿（断网暂存） */
+  fieldDrafts!: Table<FieldDraftDbRow, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
 
   constructor() {
@@ -98,6 +117,55 @@ class BridgeBearingDatabase extends Dexie {
           }
           if (typeof row.limitMm !== 'number' && typeof row.limit === 'number') row.limitMm = row.limit;
           if (typeof row.targetLiftMm !== 'number' && typeof row.lift === 'number') row.targetLiftMm = row.lift;
+        });
+      });
+
+    // v3：离线现场作业包合并能力
+    //   - 新增 points 测点布设计划（主台账可撤去测点，导入按稳定编号挂接）
+    //   - 新增 fieldOrphans 待复核区、importBatches 导入批次/失败检查点、fieldDrafts 现场草稿
+    //   - readings / acceptances 增补 pointId / sourcePackageId 字段（在 upgrade 中补齐）
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        bridges: 'id, name, bridgeType, builtYear, roadClass, archived',
+        piers: 'id, bridgeId, code, capElevation, [bridgeId+code]',
+        bearings: 'id, pierId, diseaseGrade, type, serial, [pierId+serial]',
+        steps: 'id, bridgeId, seq, state, syncRequirement, [bridgeId+seq]',
+        readings: 'id, stepId, pointId, pointCode, recordedAt, [stepId+pointCode]',
+        acceptances: 'id, bearingId, stage, conclusion, sourcePackageId, [bearingId+stage]',
+        points: 'id, stepId, pointCode, active, [stepId+pointCode]',
+        fieldOrphans: 'id, packageId, bridgeId, kind, reason, status, [bridgeId+status]',
+        importBatches: 'packageId, bridgeId, status, importedAt',
+        fieldDrafts: 'packageId, bridgeId, updatedAt',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        // 既有读数补行修订号与稳定测点编号；既有验收补行修订号
+        await tx.table('readings').toCollection().modify((row: Record<string, unknown>) => {
+          row.revision = ROW_REVISION;
+          if (typeof row.stepId === 'string' && typeof row.pointCode === 'string') {
+            row.pointId = pointIdOf(row.stepId, row.pointCode);
+          }
+        });
+        await tx
+          .table('acceptances')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION;
+          });
+        // 既有读数反推测点台账：每个步骤出现过的测点编号补登为启用测点
+        const pointsTable = tx.table<PointDbRow, string>('points');
+        const seen = new Set<string>();
+        await tx.table<ReadingRow, string>('readings').each((reading) => {
+          const id = reading.pointId ?? pointIdOf(reading.stepId, reading.pointCode);
+          if (seen.has(id)) return;
+          seen.add(id);
+          pointsTable.put({
+            id,
+            stepId: reading.stepId,
+            pointCode: reading.pointCode,
+            active: 1,
+            createdAt: reading.createdAt,
+          });
         });
       });
   }
@@ -230,6 +298,8 @@ async function seedDatabase(): Promise<void> {
   const steps: StepRow[] = [];
   const readings: ReadingRow[] = [];
   const acceptances: AcceptanceRow[] = [];
+  const points: PointDbRow[] = [];
+  const seededPointIds = new Set<string>();
 
   const operators = ['陈立强', '赵启明', '李清和', '周文斌'];
   const acceptors = ['王监理', '李总监'];
@@ -309,18 +379,29 @@ async function seedDatabase(): Promise<void> {
         revision: ROW_REVISION,
       });
 
+      // 测点布设计划：所有步骤（含未开始）都有计划测点，撤去测点在现场页操作
+      const pointCount = stepSpec.sync === 'single' ? 1 : 4;
+      for (let point = 0; point < pointCount; point += 1) {
+        const pointCode = `P${point + 1}`;
+        const id = pointIdOf(stepId, pointCode);
+        if (seededPointIds.has(id)) continue;
+        seededPointIds.add(id);
+        points.push({ id, stepId, pointCode, active: 1, createdAt: stamp });
+      }
+
       // 未开始的步骤不产生读数
       if (stepSpec.state === 'idle') return;
-      const pointCount = stepSpec.sync === 'single' ? 1 : 4;
       const rounds = stepSpec.state === 'arrived' ? 3 : 2;
       for (let round = 0; round < rounds; round += 1) {
         for (let point = 0; point < pointCount; point += 1) {
           const base = stepSpec.targetLiftMm * ((round + 1) / (rounds + 1));
           const jitter = (random() - 0.5) * 1.4;
+          const pointCode = `P${point + 1}`;
           readings.push({
             id: `read-${stepId}-${round + 1}-${point + 1}`,
             stepId,
-            pointCode: `P${point + 1}`,
+            pointId: pointIdOf(stepId, pointCode),
+            pointCode,
             displacementMm: Number((base + jitter).toFixed(2)),
             stressMpa: Number((7 + random() * 6).toFixed(2)),
             recordedAt: dateTimeText(0, 9 + round, 5 + point * 5),
@@ -335,12 +416,24 @@ async function seedDatabase(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [
+      db.bridges,
+      db.piers,
+      db.bearings,
+      db.steps,
+      db.readings,
+      db.acceptances,
+      db.points,
+      db.fieldOrphans,
+      db.importBatches,
+      db.fieldDrafts,
+    ],
     async () => {
       await db.bridges.bulkPut(bridges);
       await db.piers.bulkPut(piers);
       await db.bearings.bulkPut(bearings);
       await db.steps.bulkPut(steps);
+      await db.points.bulkPut(points);
       await db.readings.bulkPut(readings);
       await db.acceptances.bulkPut(acceptances);
     },
@@ -368,11 +461,12 @@ export async function putBridge(row: BridgeRow): Promise<void> {
   await db.bridges.put(row);
 }
 
-/** 删除桥梁并级联清理墩台 / 支座 / 步骤 / 读数 / 验收 */
+/** 删除桥梁并级联清理墩台 / 支座 / 步骤 / 读数 / 验收 / 测点；
+ *  待复核记录与导入检查点保留（归档追溯来源），仅随整库重置清理 */
 export async function removeBridge(id: string): Promise<void> {
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances, db.points],
     async () => {
       const piers = await db.piers.where('bridgeId').equals(id).toArray();
       const pierIds = piers.map((item) => item.id);
@@ -381,7 +475,10 @@ export async function removeBridge(id: string): Promise<void> {
       const stepRows = await db.steps.where('bridgeId').equals(id).toArray();
       const stepIds = stepRows.map((item) => item.id);
       if (bearingIds.length) await db.acceptances.where('bearingId').anyOf(bearingIds).delete();
-      if (stepIds.length) await db.readings.where('stepId').anyOf(stepIds).delete();
+      if (stepIds.length) {
+        await db.readings.where('stepId').anyOf(stepIds).delete();
+        await db.points.where('stepId').anyOf(stepIds).delete();
+      }
       await db.steps.where('bridgeId').equals(id).delete();
       if (pierIds.length) await db.bearings.where('pierId').anyOf(pierIds).delete();
       await db.piers.where('bridgeId').equals(id).delete();
@@ -447,10 +544,96 @@ export async function putSteps(rows: StepRow[]): Promise<void> {
 }
 
 export async function removeStep(id: string): Promise<void> {
-  await db.transaction('rw', [db.steps, db.readings], async () => {
+  await db.transaction('rw', [db.steps, db.readings, db.points], async () => {
     await db.readings.where('stepId').equals(id).delete();
+    await db.points.where('stepId').equals(id).delete();
     await db.steps.delete(id);
   });
+}
+
+/* ============================ 测点布设计划 ============================ */
+
+export async function listPoints(): Promise<PointDbRow[]> {
+  const rows = await db.points.toArray();
+  return rows.sort((a, b) => a.stepId.localeCompare(b.stepId) || a.pointCode.localeCompare(b.pointCode));
+}
+
+export async function putPoint(row: PointDbRow): Promise<void> {
+  await db.points.put(row);
+}
+
+export async function putPoints(rows: PointDbRow[]): Promise<void> {
+  await db.points.bulkPut(rows);
+}
+
+/** 取或建测点（主台账手动录入与现场包导入共用），返回当前行 */
+export async function ensurePoint(stepId: string, pointCode: string, createdByPackageId?: string): Promise<PointDbRow> {
+  const id = pointIdOf(stepId, pointCode);
+  const existing = await db.points.get(id);
+  if (existing) return existing;
+  const row: PointDbRow = {
+    id,
+    stepId,
+    pointCode,
+    active: 1,
+    createdAt: new Date().toISOString(),
+    ...(createdByPackageId ? { createdByPackageId } : {}),
+  };
+  await db.points.put(row);
+  return row;
+}
+
+/** 撤去 / 恢复测点（软删：历史读数保留） */
+export async function setPointActive(id: string, active: boolean): Promise<void> {
+  const existing = await db.points.get(id);
+  if (!existing) return;
+  await db.points.put({ ...existing, active: active ? 1 : 0 });
+}
+
+/* ====================== 现场待复核 / 批次 / 草稿 ====================== */
+
+export async function listFieldOrphans(): Promise<FieldOrphanDbRow[]> {
+  return db.fieldOrphans.toArray();
+}
+
+export async function putFieldOrphan(row: FieldOrphanDbRow): Promise<void> {
+  await db.fieldOrphans.put(row);
+}
+
+export async function updateFieldOrphan(id: string, patch: Partial<FieldOrphanDbRow>): Promise<void> {
+  const existing = await db.fieldOrphans.get(id);
+  if (!existing) return;
+  await db.fieldOrphans.put({ ...existing, ...patch });
+}
+
+export async function listImportBatches(): Promise<FieldImportBatchDbRow[]> {
+  const rows = await db.importBatches.toArray();
+  return rows.sort((a, b) => b.importedAt.localeCompare(a.importedAt));
+}
+
+export async function getImportBatch(packageId: string): Promise<FieldImportBatchDbRow | undefined> {
+  return db.importBatches.get(packageId);
+}
+
+export async function putImportBatch(row: FieldImportBatchDbRow): Promise<void> {
+  await db.importBatches.put(row);
+}
+
+export async function listFieldDrafts(): Promise<FieldDraftDbRow[]> {
+  const rows = await db.fieldDrafts.toArray();
+  return rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+export async function getFieldDraft(packageId: string): Promise<FieldDraftDbRow | undefined> {
+  return db.fieldDrafts.get(packageId);
+}
+
+export async function putFieldDraft(row: FieldDraftDbRow): Promise<void> {
+  await db.fieldDrafts.put(row);
+}
+
+export async function removeFieldDraft(packageId: string): Promise<void> {
+  await db.fieldDrafts.delete(packageId);
 }
 
 /* ============================ 测点读数 ============================ */
@@ -497,17 +680,27 @@ export interface DatabaseSnapshot {
   steps: Step[];
   readings: Reading[];
   acceptances: Acceptance[];
+  /** 以下为 v3 增补字段：旧备份缺失时按空数组处理 */
+  points?: PointDbRow[];
+  fieldOrphans?: FieldOrphanDbRow[];
+  importBatches?: FieldImportBatchDbRow[];
+  fieldDrafts?: FieldDraftDbRow[];
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [bridges, piers, bearings, steps, readings, acceptances] = await Promise.all([
-    listBridges(),
-    listPiers(),
-    listBearings(),
-    listSteps(),
-    listReadings(),
-    listAcceptances(),
-  ]);
+  const [bridges, piers, bearings, steps, readings, acceptances, points, fieldOrphans, importBatches, fieldDrafts] =
+    await Promise.all([
+      listBridges(),
+      listPiers(),
+      listBearings(),
+      listSteps(),
+      listReadings(),
+      listAcceptances(),
+      listPoints(),
+      listFieldOrphans(),
+      listImportBatches(),
+      listFieldDrafts(),
+    ]);
   return {
     name: DB_NAME,
     schemaVersion: DB_SCHEMA_VERSION,
@@ -518,13 +711,28 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     steps,
     readings,
     acceptances,
+    points,
+    fieldOrphans,
+    importBatches,
+    fieldDrafts,
   };
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [
+      db.bridges,
+      db.piers,
+      db.bearings,
+      db.steps,
+      db.readings,
+      db.acceptances,
+      db.points,
+      db.fieldOrphans,
+      db.importBatches,
+      db.fieldDrafts,
+    ],
     async () => {
       await Promise.all([
         db.bridges.clear(),
@@ -533,6 +741,10 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.steps.clear(),
         db.readings.clear(),
         db.acceptances.clear(),
+        db.points.clear(),
+        db.fieldOrphans.clear(),
+        db.importBatches.clear(),
+        db.fieldDrafts.clear(),
       ]);
       await db.bridges.bulkPut(snapshot.bridges ?? []);
       await db.piers.bulkPut(snapshot.piers ?? []);
@@ -540,6 +752,20 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.steps.bulkPut(snapshot.steps ?? []);
       await db.readings.bulkPut(snapshot.readings ?? []);
       await db.acceptances.bulkPut(snapshot.acceptances ?? []);
+      // 兼容 v2 旧备份：没有测点表时按现有读数反推补登
+      const points =
+        snapshot.points ??
+        (snapshot.readings ?? []).map((reading) => ({
+          id: reading.pointId ?? pointIdOf(reading.stepId, reading.pointCode),
+          stepId: reading.stepId,
+          pointCode: reading.pointCode,
+          active: 1,
+          createdAt: reading.createdAt,
+        }));
+      await db.points.bulkPut(points);
+      await db.fieldOrphans.bulkPut(snapshot.fieldOrphans ?? []);
+      await db.importBatches.bulkPut(snapshot.importBatches ?? []);
+      await db.fieldDrafts.bulkPut(snapshot.fieldDrafts ?? []);
     },
   );
 }
@@ -548,7 +774,18 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.bridges, db.piers, db.bearings, db.steps, db.readings, db.acceptances],
+    [
+      db.bridges,
+      db.piers,
+      db.bearings,
+      db.steps,
+      db.readings,
+      db.acceptances,
+      db.points,
+      db.fieldOrphans,
+      db.importBatches,
+      db.fieldDrafts,
+    ],
     async () => {
       await Promise.all([
         db.bridges.clear(),
@@ -557,6 +794,10 @@ export async function resetDatabase(): Promise<void> {
         db.steps.clear(),
         db.readings.clear(),
         db.acceptances.clear(),
+        db.points.clear(),
+        db.fieldOrphans.clear(),
+        db.importBatches.clear(),
+        db.fieldDrafts.clear(),
       ]);
     },
   );
@@ -565,15 +806,20 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [bridges, piers, bearings, steps, readings, acceptances] = await Promise.all([
-    db.bridges.count(),
-    db.piers.count(),
-    db.bearings.count(),
-    db.steps.count(),
-    db.readings.count(),
-    db.acceptances.count(),
-  ]);
-  return { bridges, piers, bearings, steps, readings, acceptances };
+  const [bridges, piers, bearings, steps, readings, acceptances, points, fieldOrphans, importBatches, fieldDrafts] =
+    await Promise.all([
+      db.bridges.count(),
+      db.piers.count(),
+      db.bearings.count(),
+      db.steps.count(),
+      db.readings.count(),
+      db.acceptances.count(),
+      db.points.count(),
+      db.fieldOrphans.count(),
+      db.importBatches.count(),
+      db.fieldDrafts.count(),
+    ]);
+  return { bridges, piers, bearings, steps, readings, acceptances, points, fieldOrphans, importBatches, fieldDrafts };
 }
 
 /** 结构版本信息 */

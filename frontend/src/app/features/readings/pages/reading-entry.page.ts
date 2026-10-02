@@ -27,7 +27,8 @@ import { stepActions } from '../../../core/store/step.actions';
 import { buildStepViews, selectStepStats } from '../../../core/store/step.selectors';
 import { selectBridges } from '../../../core/store/bridge.selectors';
 import { IdbTableService } from '../../../core/services/idb-table.service';
-import { putReadings, rowMeta, newId, type ReadingRow } from '../../../core/utils/db';
+import { putReadings, ensurePoint, rowMeta, newId, type ReadingRow } from '../../../core/utils/db';
+import { pointIdOf } from '../../../core/types/field-package';
 import { formatMm, formatStress } from '../../../core/utils/unit';
 import {
   TOLERANCE_HEX,
@@ -573,8 +574,15 @@ export class ReadingEntryPage {
       recordedAt: recorded,
       operator: this.operator(),
     }));
+    // 主台账手动录入：同步测点布设计划（不存在则补登为启用测点），读数携带稳定测点编号
+    await Promise.all(payload.map((row) => ensurePoint(row.stepId, row.pointCode)));
     await putReadings(
-      payload.map((row) => ({ ...row, id: newId('read'), ...rowMeta() })),
+      payload.map((row) => ({
+        ...row,
+        pointId: pointIdOf(row.stepId, row.pointCode),
+        id: newId('read'),
+        ...rowMeta(),
+      })),
     );
     this.idb.emitChange();
     this.snackBar.open(
